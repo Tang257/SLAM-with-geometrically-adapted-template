@@ -1,0 +1,513 @@
+/**
+* This file is part of DefSLAM.
+*
+* Copyright (C) 2017-2020 Jose Lamarca Peiro <jlamarca at unizar dot es>, J.M.M. Montiel (University
+*of Zaragoza) && Shaifali Parashar, Adrien Bartoli (Université Clermont Auvergne)
+* For more information see <https://github.com/unizar/DefSLAM>
+*
+* DefSLAM is free software: you can redistribute it and/or modify
+* it under the terms of the GNU General Public License as published by
+* the Free Software Foundation, either version 3 of the License, or
+* (at your option) any later version.
+*
+* DefSLAM is distributed in the hope that it will be useful,
+* but WITHOUT ANY WARRANTY; without even the implied warranty of
+* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+* GNU General Public License for more details.
+*
+* You should have received a copy of the GNU General Public License
+* along with DefSLAM. If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#include "DefLocalMapping.h"
+#include "DefKeyFrame.h"
+#include "Eigen/Dense"
+#include "Eigen/Sparse"
+#include "GroundTruthKeyFrame.h"
+#include "NormalEstimator.h"
+#include "PolySolver.h"
+#include "SchwarpDatabase.h"
+#include "ShapeFromNormals.h"
+#include "SurfaceRegistration.h"
+#include <Converter.h>
+#include <chrono>
+#include <ctime>
+#include <numeric>
+#include <stdio.h>
+#include <unistd.h>
+
+namespace defSLAM
+{
+  /***********************************
+   * Constructor of DefLocalMapping. It calls to the constructor to local mapping
+   * and initializes the parameters of the deformable local mapping. we use
+   * strSettingPath to initialize    *  
+   *  pointsToTemplate_: keypoints in the unexplored area to create a new template
+   *  chiLimit_ : Limit in residual error of the Surface registration to accept that
+   *            a template has been correctly aligned.
+   *  reg: Weight for the Schwarzian regularizer in Schwarp estimation.
+   *  bendingReg_ : Weight for the beding regularizer in Shape-from-normals.
+   *********************/
+  DefLocalMapping::DefLocalMapping(Map *pMap,
+                                   const string &strSettingPath)
+      : LocalMapping(pMap, nullptr, 0.0),
+        createTemplate_(false),
+        pointsToTemplate_(100),
+        chiLimit_(0.07)
+  {
+    cv::FileStorage fSettings(strSettingPath, cv::FileStorage::READ);
+    pointsToTemplate_ = fSettings["LocalMapping.pointsToTemplate"];
+    chiLimit_ = fSettings["LocalMapping.chiLimit"];
+    double reg_ = fSettings["LocalMapping.Schwarp.Regularizer"];
+    bendingReg_ = fSettings["LocalMapping.Bending"];
+    saveResults_ = bool(int(fSettings["Viewer.SaveResults"]));
+
+    masker_.loadRindnetFromTxt(fSettings["RindNet.Model"].string());
+    masker_.loadSampleRatioFromTxt(fSettings["Contour.Ratio"]);
+    masker_.loadContourNumFromTxt(fSettings["Contour.MaxNum"]);
+    masker_.loadContourSampleNumFromTxt(fSettings["Contour.Sampled.Num"]);
+
+    template_nx = fSettings["Template.nx"];
+    template_ny = fSettings["Template.ny"];
+    std::cout<<"template_nx: "<<template_nx<<std::endl;
+    std::cout<<"template_ny: "<<template_ny<<std::endl;
+
+    std::cout << "Deformation Mapping parameters" << std::endl;
+    std::cout << " - PointsToTemplate_ : " << pointsToTemplate_ << std::endl;
+    std::cout << " - chiLimit_ : " << chiLimit_ << std::endl;
+    std::cout << " - bendingReg_: " << bendingReg_ << std::endl;
+    warpDB_ = new SchwarpDatabase(reg_);
+  }
+
+  /****************
+     * It is the same, but it reads the information from SettingsLoader.
+     *********************/
+  DefLocalMapping::DefLocalMapping(Map *pMap, const SettingsLoader &settingsLoader)
+      : LocalMapping(pMap, nullptr, 0.0),
+        createTemplate_(false),
+        pointsToTemplate_(100),
+        chiLimit_(0.07)
+  {
+    pointsToTemplate_ = settingsLoader.getpointsToTemplate();
+    chiLimit_ = settingsLoader.getchiLimit();
+    double reg_ = settingsLoader.getschwarpReg();
+    bendingReg_ = settingsLoader.getbendingReg();
+    saveResults_ = settingsLoader.getSaveResults();
+
+    std::cout << "Deformation Mapping parameters" << std::endl;
+    std::cout << " - PointsToTemplate_ : " << pointsToTemplate_ << std::endl;
+    std::cout << " - chiLimit_ : " << chiLimit_ << std::endl;
+    std::cout << " - bendingReg_: " << bendingReg_ << std::endl;
+    warpDB_ = new SchwarpDatabase(reg_);
+  }
+
+  /***********************************
+   * Destructor of DefLocalMapping. Just to remove the SchwarpDatabase.
+   *********************/
+  DefLocalMapping::~DefLocalMapping() { delete warpDB_; }
+
+  /*********************************
+   * Run. This function is to run in parallel the deformable 
+   * mapping. It is an infinite loop that runs the deformable  
+   * mapping in case of a new keyframe
+   *********************************/
+  void DefLocalMapping::Run()
+  {
+
+    mbFinished = false;
+
+    while (1)
+    {
+      SetAcceptKeyFrames(false);
+      insideTheLoop();
+      if (Stop())
+      {
+        // Safe area to stop
+        while (isStopped() && !CheckFinish())
+        {
+          usleep(3000);
+        }
+        if (CheckFinish())
+          break;
+      }
+
+      ResetIfRequested();
+
+      if (CheckFinish())
+        break;
+
+      SetAcceptKeyFrames(true);
+
+      usleep(100000);
+    }
+
+    SetFinish();
+  }
+
+  /*********************************
+   * insideTheLoop(). This function runs the deformable 
+   * mapping. It creates the 
+   *********************************/
+  void DefLocalMapping::insideTheLoop()
+  {
+    std::ofstream maptime("maptime.txt", std::ios::in | std::ios::out | std::ios::ate);
+    auto start_all = std::chrono::steady_clock::now(); //开始时间
+    auto contourtime = std::chrono::duration_cast<std::chrono::milliseconds>(start_all - start_all);
+    // Tracking will see that Local Mapping is busy
+    // Check if there are keyframes in the queue
+    if (CheckNewKeyFrames())
+    {
+      // BoW conversion and insertion in Map
+      this->ProcessNewKeyFrame();
+      // Remove points duplicated and not visible
+      this->MapPointCulling();
+      // Use NRSfM to create or refine surfaces.
+      this->NRSfM();
+
+      auto end1 = std::chrono::steady_clock::now();
+      masker_.contourMask(referenceKF_->KFimage.clone(), referenceKF_->_contoursSamples);
+      auto end2 = std::chrono::steady_clock::now();
+      contourtime = std::chrono::duration_cast<std::chrono::milliseconds>(end2-end1);
+
+      mbAbortBA = false;
+    }
+    auto end_all = std::chrono::steady_clock::now(); //开始时间
+    auto duration_whole = std::chrono::duration_cast<std::chrono::milliseconds>(end_all - start_all);
+    maptime<<contourtime.count()<<" "<<duration_whole.count()<<std::endl;
+    maptime.close();
+  }
+
+  /*********************************
+   * UpdateTemplate(). This function is called in the deformable 
+   * tracking and updates the template with the reference keyframe 
+   * selected. It creates the new map points with the surface and 
+   * create the templates 
+   *********************************/
+  bool DefLocalMapping::updateTemplate()
+  {
+    unique_lock<mutex> lock(mMutexReset);
+    if ((createTemplate_) & (!stopRequested()))
+    {
+      std::unique_lock<std::mutex> M(
+          static_cast<DefMap *>(mpMap)->MutexUpdating);
+      static_cast<DefMap *>(mpMap)->clearTemplate();
+      // 将新的点添加到mappoints中
+      this->CreateNewMapPoints();
+      // 通过RindNet网络提取轮廓特征
+
+      // 提取轮廓信息
+      // masker_.contourMask(referenceKF_->KFimage.clone(), referenceKF_->_contoursSamples);
+      // 首先是在继承的TriangularMesh()函数上通过Bicubic B-Spline插值将对齐后的surface离散成template
+      // 通过最小化重映射误差优化
+      // 再通过ExtractMeanCurvatures()得到template的平均曲率
+      static_cast<DefMap *>(mpMap)->createTemplate(referenceKF_);
+      static_cast<DefKeyFrame *>(referenceKF_)->assignTemplate();
+
+      //Add to DB all ancho keyframes (relocalization)
+      //referenceKF_->addToDB();
+
+      createTemplate_ = false;
+      return true;
+    }
+    return false;
+  }
+
+  /******
+   * ProcessNewKeyframe. It add the keyframe to the warp database
+   * to extract its warp with its covisible. In adition it add the
+   * keyframe to a spanning covisibility tree as in ORBSLAM2:LocalMapping. 
+   ******/
+  void DefLocalMapping::ProcessNewKeyFrame()
+  {
+    LocalMapping::ProcessNewKeyFrame();
+    warpDB_->add(mpCurrentKeyFrame);
+  }
+
+  /*************************
+   * NRSfM. Given the warp and its derivates it estimates the normals.
+   * With those normals it computes an up-to-scale surface. It align that
+   * surface to recover the scale with the map points pose registered when
+   * the keyframe was created
+   *****************************/
+  void DefLocalMapping::NRSfM()
+  {
+    // When there is more than two keyframes, the non-rigid reconstruction starts.
+
+    {
+      std::cout << "NORMAL ESTIMATOR IN - ";
+      NormalEstimator NormalEstimator_(this->warpDB_);
+      NormalEstimator_.ObtainK1K2();
+      std::cout << " NORMAL ESTIMATOR OUT";
+    }
+    if (mpMap->GetAllKeyFrames().size() == 1)
+    {
+      referenceKF_ = mpMap->GetAllKeyFrames()[0];
+    }
+
+    auto newTemplate = needNewTemplate();
+    KeyFrame *kfForTemplate;
+    if (newTemplate)
+    {
+      printf("New template requested \n");
+      kfForTemplate = mpCurrentKeyFrame;
+    }
+    else
+    {
+      kfForTemplate = selectKeyframe();
+    }
+
+    // Check if there are enough normals to do the shape-from-normals
+    if (!static_cast<DefKeyFrame *>(kfForTemplate)
+             ->surface->enoughNormals())
+    {
+      printf("Not enough normals \n");
+      return;
+    }
+    {
+      ShapeFromNormals SfN(kfForTemplate, bendingReg_);
+
+      // Integrate the normals to recover the surface
+      if (!SfN.estimate())
+      {
+        printf("ShapeFromNormals not sucessful \n");
+        return;
+      }
+    }
+    if (saveResults_ && kfForTemplate->stereoAvailable)
+    {
+      float scale =
+          static_cast<GroundTruthKeyFrame *>(kfForTemplate)->estimateAngleErrorAndScale();
+      std::cout << "Scale Error Keyframe : " << scale << " " << std::endl;
+    }
+    if (kfForTemplate != mpMap->GetAllKeyFrames()[0])
+    {
+      SurfaceRegistration SurfaceRegistration_(kfForTemplate, chiLimit_, true);
+      bool wellRegistered = SurfaceRegistration_.registerSurfaces();
+      if (!wellRegistered)
+      {
+        printf("SurfaceRegistration not sucessful (Not enough points to align or chi2 too big \n");
+        return;
+      }
+    }
+    referenceKF_ = kfForTemplate;
+    //Add all keyframes to DB (relocalization)
+    static_cast<DefKeyFrame *>(mpCurrentKeyFrame)->setReferenceKeyframe(referenceKF_);
+    mpCurrentKeyFrame->addToDB();
+
+    createTemplate_ = true;
+  }
+
+  /*********************************
+   * Create the new map points. They are extracted from the surface 
+   * estimated for the keyframe with the Isometric NRSfM.
+   ********************************/
+  void DefLocalMapping::CreateNewMapPoints()
+  {
+    cv::Mat Twc = referenceKF_->GetPoseInverse();
+    size_t nval = referenceKF_->mvKeysUn.size();
+    int cols = referenceKF_->imGray.cols;
+    cv::Mat mask(referenceKF_->imGray.rows, referenceKF_->imGray.cols,
+                 CV_8UC1, cv::Scalar(0));
+    int const max_BINARY_value = 255;
+
+    for (size_t i = 0; i < nval; i++)
+    {
+      MapPoint *pMP = referenceKF_->GetMapPoint(i);
+      if (pMP)
+      {
+        if (pMP->isBad())
+          continue;
+        mask.at<char>(referenceKF_->mvKeysUn[i].pt.y,
+                      referenceKF_->mvKeysUn[i].pt.x) = 255;
+      }
+    }
+    cv::Mat kernel;
+    int kernel_size = cols / 20;
+    int ddepth = -1;
+    cv::Point anchor(-1, -1);
+    double delta;
+    delta = 0;
+    kernel = cv::Mat::ones(kernel_size, kernel_size, CV_32F);
+
+    cv::filter2D(mask, mask, ddepth, kernel, anchor, delta, cv::BORDER_DEFAULT);
+    double threshold_value = 1;
+    //     1: Binary Inverted
+    cv::threshold(mask, mask, threshold_value, max_BINARY_value, 0);
+    uint newPoints(0);
+    for (size_t i = 0; i < nval; i++)
+    {
+      MapPoint *pMP = referenceKF_->GetMapPoint(i);
+
+      if (pMP)
+      {
+        if (pMP->isBad())
+          continue;
+        DefMapPoint *defMP = static_cast<DefMapPoint *>(pMP);
+        cv::Vec3f x3c;
+
+        static_cast<DefKeyFrame *>(referenceKF_)
+            ->surface->get3DSurfacePoint(i, x3c);
+
+        cv::Mat x3ch(4, 1, CV_32F);
+        x3ch.at<float>(0, 0) = x3c(0);
+        x3ch.at<float>(1, 0) = x3c(1);
+        x3ch.at<float>(2, 0) = x3c(2);
+        x3ch.at<float>(3, 0) = 1;
+
+        cv::Mat x3wh(4, 1, CV_32F);
+        x3wh = Twc * x3ch;
+        cv::Mat x3w(3, 1, CV_32F);
+        x3w.at<float>(0, 0) = x3wh.at<float>(0, 0);
+        x3w.at<float>(1, 0) = x3wh.at<float>(1, 0);
+        x3w.at<float>(2, 0) = x3wh.at<float>(2, 0);
+        cv::Mat X3Do = static_cast<DefMapPoint *>(pMP)
+                           ->PosesKeyframes[referenceKF_]
+                           .clone();
+
+        if (X3Do.empty())
+        {
+          pMP->SetWorldPos(x3w);
+          defMP->lastincorporasion = false;
+          continue;
+        }
+        pMP->SetWorldPos(x3w);
+      }
+      else
+      {
+        const auto &kpt = referenceKF_->mvKeysUn[i].pt;
+        if (mask.at<char>(kpt.y, kpt.x))
+        {
+          continue;
+        }
+        cv::Vec3f x3c;
+        static_cast<DefKeyFrame *>(referenceKF_)
+            ->surface->get3DSurfacePoint(i, x3c);
+
+        cv::Mat x3ch(4, 1, CV_32F);
+        x3ch.at<float>(0, 0) = x3c(0);
+        x3ch.at<float>(1, 0) = x3c(1);
+        x3ch.at<float>(2, 0) = x3c(2);
+        x3ch.at<float>(3, 0) = 1;
+
+        cv::Mat x3wh(4, 1, CV_32F);
+        x3wh = Twc * x3ch;
+        cv::Mat x3w(3, 1, CV_32F);
+        x3w.at<float>(0, 0) = x3wh.at<float>(0, 0);
+        x3w.at<float>(1, 0) = x3wh.at<float>(1, 0);
+        x3w.at<float>(2, 0) = x3wh.at<float>(2, 0);
+
+        pMP = new DefMapPoint(x3w, referenceKF_, mpMap);
+
+        pMP->AddObservation(referenceKF_, i);
+        referenceKF_->addMapPoint(pMP, i);
+
+        pMP->ComputeDistinctiveDescriptors();
+        pMP->UpdateNormalAndDepth();
+        mpMap->addMapPoint(pMP);
+        mlpRecentAddedMapPoints.push_back(pMP);
+      }
+    }
+    std::cout << "Points Created : " << newPoints << std::endl;
+  }
+
+  /*********************************
+   * This function evaluates if the algorithm is visiting new zones. It
+   * measures the ocupancy of the map points in the image with a mask.
+   * Then, it counts how many keypoints are out of the masked zone to initialize.
+   * If it goes over a certain threshold set up in the contructor, it is exploring.
+   ********************************/
+  bool DefLocalMapping::needNewTemplate()
+  {
+    return (static_cast<DefKeyFrame *>(mpCurrentKeyFrame)->kindKeyframe == DefKeyFrame::kindofKeyFrame::REFERENCE);
+  }
+
+  /***************************************
+   *  This function pick up the reference keyframe in case that there is no 
+   * exploration. From the observed points we select the keyframe with the highest number
+   * of observed map points.
+  ****************************************/
+  ORB_SLAM2::KeyFrame *DefLocalMapping::selectKeyframe()
+  {
+    size_t nval = this->mpCurrentKeyFrame->mvKeysUn.size();
+    std::unordered_map<KeyFrame *, int> countKFMatches;
+    int CurrentKFMatches(0);
+
+    // 1. Retrieve reference KF with the highest number of matches
+    for (size_t i = 0; i < nval; i++)
+    {
+      MapPoint *pMP = mpCurrentKeyFrame->GetMapPoint(i);
+      if (pMP)
+      {
+        if (pMP->isBad())
+          continue;
+        KeyFrame *refkfi = pMP->GetReferenceKeyFrame();
+        if (countKFMatches.count(refkfi) == 0)
+          countKFMatches[refkfi] = 0;
+        countKFMatches[refkfi]++;
+        CurrentKFMatches++;
+      }
+    }
+
+    // copy key-value pairs from the map to the vector
+    // std::pair<KeyFrame *, int>
+    std::vector<std::pair<KeyFrame *, int>> vec;
+    std::copy(countKFMatches.begin(),
+              countKFMatches.end(),
+              std::back_inserter<std::vector<std::pair<KeyFrame *, int>>>(vec));
+
+    /// We search all the possible matches with the reference keyframes.
+    /// there will be more points
+    KeyFrame *bestBoy(referenceKF_);
+
+    // Get matched points
+    const vector<MapPoint *> vpMapPointMatches =
+        mpCurrentKeyFrame->GetMapPointMatches();
+
+    int CountMatches(0);
+    for (uint i(0); i < vec.size(); i++)
+    {
+      const std::pair<KeyFrame *, int> kv = vec[i];
+      // Only take into account those with more than 30 matches
+      KeyFrame *refkf = kv.first;
+      // Get matched points between keyframes
+      vector<pair<size_t, size_t>> vMatchedIndices;
+      int currentMatches(0);
+      for (size_t i = 0; i < vpMapPointMatches.size(); i++)
+      {
+        MapPoint *mapPoint = vpMapPointMatches[i];
+        if (!mapPoint)
+          continue;
+        if (mapPoint->isBad())
+          continue;
+        /// Check that the point is in both keyframes
+        if (mapPoint->IsInKeyFrame(mpCurrentKeyFrame) &&
+            (mapPoint->IsInKeyFrame(refkf)))
+        {
+          currentMatches++;
+        }
+      }
+      if (currentMatches > CountMatches)
+      {
+        bestBoy = refkf;
+        CountMatches = currentMatches;
+      }
+    }
+
+    return bestBoy;
+  }
+
+  // Reset the algorithm if reset bottom is pushed in the Viewer.
+  void DefLocalMapping::ResetIfRequested()
+  {
+    unique_lock<mutex> lock(mMutexReset);
+    if (mbResetRequested)
+    {
+      static_cast<DefMap *>(mpMap)->clear();
+      warpDB_->clear();
+      createTemplate_ = false;
+      mlNewKeyFrames.clear();
+      mlpRecentAddedMapPoints.clear();
+      mbResetRequested = false;
+    }
+  }
+} // namespace defSLAM

@@ -1,0 +1,3 @@
+CNN /home/tang/Github/SD-DefSLAM_contour/unet16_binary_20/model_1.pt
+#BrightFilter 200
+BorderFilter 10 10 10 10 10
